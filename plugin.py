@@ -2748,19 +2748,10 @@ class FetchUrlPlugin(MaiBotPlugin):
 
     @Tool(
         "fetch_url",
-        brief_description="抓取任意 URL：网页/PDF 转为 Markdown 文本返回，图片直接以图像形式返回，支持分页读取与超长内容自动总结。",
+        brief_description="读取已知 HTTP(S) 链接：网页、PDF 和 JSON 返回文本，图片返回图像供观察；支持分段读取与超长内容处理。",
         detailed_description=(
-            "抓取一个 URL 并返回其内容。会自动根据响应类型分流：图片直接以图像形式回传供你观察；"
-            "网页 / PDF 等转为 Markdown 文本。\n"
-            "参数说明：\n"
-            "- url：string，必填。要抓取的完整 URL（http/https）。\n"
-            "- start_char：integer，可选，默认 0。返回文本窗口的起始字符位置。\n"
-            "- end_char：integer，可选，默认 -1（文档末尾）。返回文本窗口的结束字符位置。\n"
-            "- on_exceed：string，可选，summarize 或 truncate，默认 summarize。窗口内容超过长度上限时，"
-            "summarize 表示调用 LLM 总结，truncate 表示直接截断返回原文。\n"
-            "- summary_focus：string，可选。总结时需要特别关注的方面。\n"
-            "结果中会标注文档总长与本次返回的窗口范围；当内容被总结或截断时，"
-            "可通过 start_char / end_char 指定不超过长度上限的窗口来分段获取未删改的原文。"
+            "用于查看已知链接的内容。文本结果标明文档总长、返回范围和是否经过总结或截断，"
+            "可据此继续分段读取。网页和 PDF 返回转换后的 Markdown，而非原始文件字节。"
         ),
         parameters=[
             ToolParameterInfo(
