@@ -54,6 +54,20 @@
 - VLM 任务未配置时自动跳过，保留 jina / 原始 alt
 - 直接抓取的单张图片无需此机制——MaiBot 主程序会自动为工具回传的图片生成并缓存描述
 
+### 定向浏览器读取与请求安全
+
+百度百科词条和 KKBOX 歌曲原页默认由独立匿名 Chromium 读取，不再先用普通 HTTP 请求撞上验证页。读取仍返回原页面的 Markdown，继续使用现有元信息、分页、缓存及 Tool/API/LRS 接口。图片、PDF、JSON 和其他网址保持原有分流。
+
+浏览器保持 TLS 证书校验和沙箱，HTTP(S) 资源使用域名白名单和地址预检，出站连接另由认证隧道约束；阻止媒体、字体、图片、WebSocket、Service Worker、弹窗及非必要写请求，不加载个人浏览器档案或配置中的登录 Cookie。站点签发的匿名会话仅存内存，最多保留 15 分钟；请求串行，同站至少间隔 2 秒。遇到访问拒绝或验证码时明确失败并冷却 60 秒，不自动换 IP、重试其他后端或把验证页缓存成正文。
+
+网站 HTTPS 隧道经过本机随机端口的认证出站代理，不开放给局域网。隧道仅允许资源白名单的 443 端口，一般 DNS 结果必须全部为公网地址，再按校验后的 IP 连接，防止原生重定向和 Worker 绕过页面钩子。
+
+系统 DNS 全部返回 `198.18.0.0/15` Fake-IP 时，仅在已有 `fetch.allow_private_networks=true` 授权且没有显式上游代理的情况下，将其识别为系统透明代理入口。该例外不扩大到回环、普通私网或混合地址，也不会把 Fake-IP 交给上游代理。最终实现保留系统 DNS，不使用额外的外部 DNS 服务。隧道不解密 HTTPS，浏览器仍验证原网站证书；这不是操作系统级网络沙箱。代理凭据与临时认证不写入日志或正文。
+
+`[browser]` 设置：`enabled=true`、`timeout=30`（总预算，范围 5–45 秒）、`baike_proxy="inherit"`（隧道经 `fetch.proxy` 转发）、`kkbox_proxy="direct"`（隧道直接连接目标）。上游 CONNECT 使用已验证的公网 IP，目标 TLS 主机名仍为原网址；基于域名的代理分流可能因此与旧链路不同。可以单独关闭浏览器路径。修改策略会隔离旧正文缓存并清理匿名会话；这不会改系统代理。UA 根据实际 Chromium 版本生成，HTTP 路径的 `fetch.user_agent` 保持原配置。
+
+依赖 Playwright 1.58 或更新版本，以及 Chromium 145 或更新版本。当前主程序已声明 Playwright 依赖；其他部署缺少浏览器时可在对应 Python 环境运行 `python -m playwright install chromium`，插件不会自动下载浏览器。网站若仍要求人工验证码，返回 `CAPTCHA_REQUIRED`；未完成脚本校验返回 `BROWSER_CHALLENGE`，不承诺所有网站都能自动读取。
+
 ## 安装
 
 1. 将本插件目录放入 MaiBot 的 `plugins/` 目录：

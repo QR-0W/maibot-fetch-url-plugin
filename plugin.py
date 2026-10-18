@@ -17,8 +17,11 @@ import ipaddress
 import json
 import math
 import re
+import secrets
+import socket
+import ssl
 import time
-from base64 import b64encode
+from base64 import b64decode, b64encode
 from collections import OrderedDict
 from collections.abc import Mapping, Sequence
 from copy import deepcopy
@@ -28,7 +31,7 @@ from io import BytesIO
 from pathlib import Path
 from types import UnionType
 from typing import Any, Literal, Union, get_args, get_origin
-from urllib.parse import urljoin, urlparse
+from urllib.parse import unquote, urljoin, urlparse, urlsplit
 
 import httpx
 from bs4 import BeautifulSoup
@@ -1652,6 +1655,19 @@ class CacheSectionConfig(PluginConfigBase):
     )
 
 
+class BrowserSectionConfig(PluginConfigBase):
+    """已知风控站点的定向浏览器读取。"""
+
+    __ui_label__ = "浏览器读取"
+    __ui_icon__ = "shield"
+    __ui_order__ = 8
+
+    enabled: bool = Field(default=True, description="百科词条与 KKBOX 歌曲原页使用独立匿名浏览器，其他网址保持原读取方式。")
+    timeout: float = Field(default=30.0, ge=5.0, le=45.0, description="单次浏览器读取总预算（秒），包含排队、验证与加载。")
+    baike_proxy: Literal["inherit", "direct"] = Field(default="inherit", description="百科访问路径：inherit 使用 fetch.proxy，direct 不使用浏览器代理。")
+    kkbox_proxy: Literal["inherit", "direct"] = Field(default="direct", description="KKBOX 访问路径，默认 direct；仅影响这些歌曲页面，不改系统或其他请求代理。")
+
+
 class FetchUrlConfig(PluginConfigBase):
     """插件完整配置。"""
 
@@ -1663,6 +1679,7 @@ class FetchUrlConfig(PluginConfigBase):
     llm: LLMSectionConfig = Field(default_factory=LLMSectionConfig)
     alt_text: AltTextSectionConfig = Field(default_factory=AltTextSectionConfig)
     cache: CacheSectionConfig = Field(default_factory=CacheSectionConfig)
+    browser: BrowserSectionConfig = Field(default_factory=BrowserSectionConfig)
 
 
 
@@ -1786,6 +1803,10 @@ class EffectiveFetchUrlConfig:
     fetch_cache_enabled: bool
     fetch_cache_ttl_seconds: int
     fetch_cache_max_entries: int
+    browser_enabled: bool = True
+    browser_timeout: float = 30.0
+    browser_baike_proxy: str = "inherit"
+    browser_kkbox_proxy: str = "direct"
 
 
 def _effective_bool(value: bool | None, default: bool) -> bool:
@@ -1880,6 +1901,10 @@ def resolve_effective_fetch_url_config(cfg: FetchUrlConfig) -> EffectiveFetchUrl
         alt_image_max_animation_frames=max(
             0, _effective_int(alt_image.max_animation_frames, 512)
         ),
+        browser_enabled=cfg.browser.enabled,
+        browser_timeout=cfg.browser.timeout,
+        browser_baike_proxy=cfg.browser.baike_proxy,
+        browser_kkbox_proxy=cfg.browser.kkbox_proxy,
         fetch_cache_enabled=_effective_bool(cfg.cache.enabled, DEFAULT_FETCH_CACHE_ENABLED),
         fetch_cache_ttl_seconds=max(
             0, _effective_int(cfg.cache.ttl_seconds, DEFAULT_FETCH_CACHE_TTL_SECONDS)
@@ -2029,6 +2054,397 @@ def _normalize_lrs_procedure_result(
 # --------------------------------------------------------------------------- #
 
 
+_BROWSER_RESOURCE_DOMAINS = {"baike": ("baidu.com", "bdimg.com", "bdstatic.com"), "kkbox": ("kkbox.com", "kkbox.com.tw", "kfs.io", "awswaf.com")}
+
+
+def _browser_network_patterns(site: str) -> list[dict[str, Any]]:
+    patterns = []
+    for domain in _BROWSER_RESOURCE_DOMAINS[site]:
+        patterns.extend(({"urlPattern": f"https://{domain}/*", "block": False}, {"urlPattern": f"https://*.{domain}/*", "block": False}))
+    patterns.append({"urlPattern": "*://*:*/*", "block": True})
+    return patterns
+
+
+def _browser_site_for_url(url: str) -> str | None:
+    """只分流已验证的文章路径，不吞掉同域图片、PDF 或接口。"""
+    parsed = urlparse(url)
+    if parsed.scheme not in {"http", "https"} or parsed.username or parsed.password:
+        return None
+    if parsed.path.lower().endswith((".pdf", ".png", ".jpg", ".jpeg", ".gif", ".webp", ".json")):
+        return None
+    if parsed.hostname == "baike.baidu.com" and parsed.path.startswith("/item/"):
+        return "baike"
+    if parsed.hostname in {"kkbox.com", "www.kkbox.com"} and re.fullmatch(r"/[a-z]{2}/[a-z]{2}/song/[^/]+/?", parsed.path, re.I):
+        return "kkbox"
+    return None
+
+
+def _browser_resource_allowed(site: str, url: str) -> bool:
+    try:
+        parsed = urlparse(url)
+    except ValueError:
+        return False
+    if parsed.scheme != "https" or parsed.username or parsed.password:
+        return False
+    host = parsed.hostname or ""
+    return any(host == domain or host.endswith("." + domain) for domain in _BROWSER_RESOURCE_DOMAINS.get(site, ()))
+
+
+def _browser_access_error(status: int, headers: Mapping[str, str], html: str) -> str:
+    action = next((str(value).lower() for key, value in headers.items() if key.lower() == "x-amzn-waf-action"), "")
+    if action == "captcha":
+        return "CAPTCHA_REQUIRED：站点要求人工验证码，已停止自动读取。"
+    if action == "challenge" or (status == 202 and "awswaf" in html.lower()):
+        return "BROWSER_CHALLENGE：站点脚本验证未完成，未取得正文。"
+    if status in {403, 429}:
+        return f"ACCESS_DENIED：站点拒绝访问（HTTP {status}），未取得正文。"
+    soup = BeautifulSoup(html, "html.parser") if html else None
+    title = soup.title.get_text(" ", strip=True).casefold() if soup is not None and soup.title else ""
+    if title in {"human verification", "百度安全验证", "安全验证", "security verification", "just a moment...", "access denied"}:
+        return "CAPTCHA_REQUIRED：返回的是安全验证页，未取得正文。"
+    return ""
+
+
+def _validate_browser_document(requested: str, final: str, status: int, headers: Mapping[str, str], html: str) -> None:
+    problem = _browser_access_error(status, headers, html)
+    if problem:
+        raise FetchUrlError(problem)
+    if not 200 <= status < 300:
+        raise FetchUrlError(f"浏览器读取失败（HTTP {status}）。")
+    original, actual = urlparse(requested), urlparse(final)
+    site = _browser_site_for_url(requested)
+    if _browser_site_for_url(final) != site or unquote(original.path).rstrip("/") != unquote(actual.path).rstrip("/"):
+        raise FetchUrlError("站点跳转到了其他页面，拒绝将其当成原文。")
+    soup = BeautifulSoup(html, "html.parser")
+    for node in soup(["script", "style", "noscript", "nav", "header", "footer"]):
+        node.decompose()
+    heading = soup.find("h1")
+    heading_text = heading.get_text(" ", strip=True) if heading else ""
+    if not heading_text or heading_text.casefold() in {"human verification", "安全验证", "security verification", "百度百科", "kkbox", "just a moment"} or len(soup.get_text(" ", strip=True)) < 100:
+        raise FetchUrlError("EMPTY_DOCUMENT：浏览器未返回有效文章正文，拒绝缓存空壳页面。")
+
+
+class _BrowserTunnelGuard:
+    """Authenticated CONNECT egress for public targets and authorized system Fake-IP transport.
+
+    The embedding module supplies FetchUrlError and _browser_resource_allowed.
+    Call start before reading proxy, and always await close after browser shutdown.
+    """
+
+    _MAX_HEADER = 16 * 1024
+    _MAX_CONNECTIONS = 32
+    _HANDSHAKE_SECONDS = 12
+    _RELAY_SECONDS = 180
+    _CLOSE_SECONDS = 2
+
+    def __init__(self, site: str, upstream: str = '', allow_system_fake_ip: bool = False) -> None:
+        self._site = site
+        self._allow_system_fake_ip = allow_system_fake_ip
+        self.uses_system_fake_ip = False
+        self._upstream = upstream.strip()
+        self._server = None
+        self._proxy = None
+        self._tasks = set()
+        self._writers = set()
+        self._closing = False
+        self._username = secrets.token_urlsafe(24)
+        self._password = secrets.token_urlsafe(32)
+        self._credentials = (self._username + ':' + self._password).encode('ascii')
+        self._upstream_options = None
+        self.last_error = ''
+
+    @property
+    def proxy(self) -> dict[str, str]:
+        if self._proxy is None:
+            raise FetchUrlError('浏览器安全隧道尚未启动')
+        return dict(self._proxy)
+
+    async def start(self) -> None:
+        if self._server is not None:
+            return
+        self._upstream_options = await asyncio.to_thread(self._parse_upstream)
+        self._closing = False
+        self.last_error = ''
+        self._server = await asyncio.start_server(
+            self._accept, '127.0.0.1', 0,
+            limit=self._MAX_HEADER, backlog=self._MAX_CONNECTIONS,
+        )
+        port = self._server.sockets[0].getsockname()[1]
+        self._proxy = {
+            'server': f'http://127.0.0.1:{port}',
+            'username': self._username,
+            'password': self._password,
+            'bypass': '<-loopback>',
+        }
+
+    async def close(self) -> None:
+        self._closing = True
+        server, self._server = self._server, None
+        self._proxy = None
+        if server is not None:
+            server.close()
+        for writer in tuple(self._writers):
+            writer.close()
+        current = asyncio.current_task()
+        tasks = [task for task in self._tasks if task is not current]
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        self._tasks.difference_update(tasks)
+        await asyncio.gather(*(self._close_writer(w) for w in tuple(self._writers)), return_exceptions=True)
+        if server is not None:
+            async with asyncio.timeout(self._CLOSE_SECONDS):
+                await server.wait_closed()
+
+    def _parse_upstream(self) -> tuple[str, int, str | None, ssl.SSLContext | None] | None:
+        if not self._upstream:
+            return None
+        try:
+            parsed = urlsplit(self._upstream)
+            if parsed.scheme not in {'http', 'https'}:
+                raise FetchUrlError('浏览器安全隧道上游仅支持 HTTP/HTTPS，不支持 SOCKS')
+            if not parsed.hostname or parsed.path not in {'', '/'} or parsed.query or parsed.fragment:
+                raise FetchUrlError('浏览器安全隧道上游代理地址无效')
+            port = parsed.port if parsed.port is not None else (443 if parsed.scheme == 'https' else 80)
+            if not 1 <= port <= 65535:
+                raise FetchUrlError('浏览器安全隧道上游代理端口无效')
+            credentials = None
+            if parsed.username is not None or parsed.password is not None:
+                credentials = b64encode((unquote(parsed.username or '') + ':' + unquote(parsed.password or '')).encode('utf-8')).decode('ascii')
+                if len(credentials) > self._MAX_HEADER // 2:
+                    raise FetchUrlError('浏览器安全隧道上游认证信息过长')
+            context = ssl.create_default_context() if parsed.scheme == 'https' else None
+            return parsed.hostname, port, credentials, context
+        except ValueError as exc:
+            raise FetchUrlError('浏览器安全隧道上游代理地址或端口无效') from exc
+
+    def _accept(self, reader, writer) -> None:
+        if self._closing:
+            writer.close()
+            return
+        if len(self._tasks) >= self._MAX_CONNECTIONS:
+            self.last_error = '浏览器安全隧道连接数已达到上限'
+            writer.write(b'HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\nContent-Length: 0\r\n\r\n')
+            writer.close()
+            return
+        self._writers.add(writer)
+        task = asyncio.create_task(self._serve(reader, writer))
+        self._tasks.add(task)
+        task.add_done_callback(self._task_finished)
+
+    def _task_finished(self, task) -> None:
+        self._tasks.discard(task)
+        if not task.cancelled():
+            error = task.exception()
+            if error is not None:
+                self.last_error = f'浏览器安全隧道处理失败（{type(error).__name__}）'
+
+    async def _close_writer(self, writer) -> None:
+        writer.close()
+        try:
+            async with asyncio.timeout(self._CLOSE_SECONDS):
+                await writer.wait_closed()
+        except (Exception, asyncio.CancelledError):
+            pass
+        finally:
+            self._writers.discard(writer)
+
+    async def _headers(self, reader):
+        try:
+            data = await reader.readuntil(b'\r\n\r\n')
+        except (asyncio.LimitOverrunError, asyncio.IncompleteReadError) as exc:
+            raise FetchUrlError('隧道握手头不完整或超过 16KB 上限') from exc
+        if len(data) > self._MAX_HEADER:
+            raise FetchUrlError('隧道握手头超过 16KB 上限')
+        lines = data[:-4].decode('latin-1').split('\r\n')
+        headers = {}
+        for line in lines[1:]:
+            name, separator, value = line.partition(':')
+            if not separator or not re.fullmatch(r"[!#$%&'*+.^_`|~0-9A-Za-z-]+", name):
+                raise FetchUrlError('隧道握手头格式无效')
+            name = name.lower()
+            if name in headers:
+                raise FetchUrlError('隧道握手头包含重复字段')
+            headers[name] = value.strip()
+        return lines[0], headers
+
+    def _authenticated(self, headers) -> bool:
+        value = headers.get('proxy-authorization', '')
+        kind, separator, encoded = value.partition(' ')
+        if not separator or kind.lower() != 'basic':
+            return False
+        try:
+            credentials = b64decode(encoded, validate=True)
+        except (ValueError, UnicodeEncodeError):
+            return False
+        return secrets.compare_digest(credentials, self._credentials)
+
+    async def _target(self, authority: str) -> list[tuple[int, str]]:
+        if any(c.isspace() or c in '/\\?#@%' for c in authority):
+            raise FetchUrlError('拒绝目标：CONNECT authority 格式无效')
+        try:
+            parsed = urlsplit('//' + authority)
+            host, port = parsed.hostname, parsed.port
+        except ValueError as exc:
+            raise FetchUrlError('拒绝目标：CONNECT 主机或端口无效') from exc
+        if not host or port != 443:
+            raise FetchUrlError('拒绝目标：只允许 HTTPS 443 端口')
+        if ':' in host and not authority.startswith('['):
+            raise FetchUrlError('拒绝目标：IPv6 authority 必须使用方括号')
+        if not _browser_resource_allowed(self._site, 'https://' + authority + '/'):
+            raise FetchUrlError('拒绝目标：域名不在该站点的资源白名单内')
+        try:
+            addresses = await asyncio.get_running_loop().getaddrinfo(
+                host, 443, family=socket.AF_UNSPEC, type=socket.SOCK_STREAM,
+            )
+        except OSError as exc:
+            raise FetchUrlError('拒绝目标：DNS 解析失败') from exc
+        if not addresses:
+            raise FetchUrlError('拒绝目标：DNS 未返回可连接地址')
+        fake_network = ipaddress.ip_network('198.18.0.0/15')
+        fake = [ipaddress.ip_address(entry[4][0]) in fake_network if entry[0] == socket.AF_INET else False for entry in addresses]
+        # Fake-IP 是已有系统代理的转发入口，不能冒充公网目标或扩大为普通私网授权。
+        if any(fake):
+            if not all(fake):
+                raise FetchUrlError('拒绝目标：系统 DNS 混合了 Fake-IP 与其他地址')
+            if not self._allow_system_fake_ip or self._upstream_options is not None:
+                raise FetchUrlError('拒绝目标：系统 Fake-IP 仅可在已有内网访问授权下经系统透明代理转发，不可传给显式上游代理')
+            self.uses_system_fake_ip = True
+        validated = []
+        for family, socktype, protocol, canonname, address in addresses:
+            try:
+                ip = ipaddress.ip_address(address[0])
+            except ValueError as exc:
+                raise FetchUrlError('拒绝目标：DNS 返回无效地址') from exc
+            authorized_proxy = self.uses_system_fake_ip and ip.version == 4 and ip in fake_network
+            if (not ip.is_global and not authorized_proxy) or ip.is_multicast or ip.is_reserved or ip.is_unspecified:
+                raise FetchUrlError('拒绝目标：DNS 包含非公网、私网或保留地址')
+            if family not in {socket.AF_INET, socket.AF_INET6}:
+                raise FetchUrlError('拒绝目标：DNS 返回不支持的地址类型')
+            entry = family, str(ip)
+            if entry not in validated:
+                validated.append(entry)
+        validated.sort(key=lambda item: item[0] != socket.AF_INET)
+        return validated
+
+    async def _connect(self, addresses: list[tuple[int, str]]) -> tuple[asyncio.StreamReader, asyncio.StreamWriter]:
+        if self._upstream_options is None:
+            for family, ip in addresses:
+                try:
+                    reader, writer = await asyncio.open_connection(
+                        ip, 443, family=family, flags=socket.AI_NUMERICHOST,
+                        limit=self._MAX_HEADER,
+                    )
+                except OSError:
+                    continue
+                self._writers.add(writer)
+                return reader, writer
+            raise FetchUrlError('连接目标失败：已校验的公网地址均不可连接')
+        host, port, credentials, context = self._upstream_options
+        reader, writer = await asyncio.open_connection(
+            host, port, ssl=context,
+            server_hostname=host if context is not None else None,
+            limit=self._MAX_HEADER,
+        )
+        self._writers.add(writer)
+        try:
+            family, ip = addresses[0]
+            authority = f'[{ip}]:443' if family == socket.AF_INET6 else f'{ip}:443'
+            request = f'CONNECT {authority} HTTP/1.1\r\nHost: {authority}\r\n'
+            if credentials is not None:
+                request += f'Proxy-Authorization: Basic {credentials}\r\n'
+            writer.write((request + '\r\n').encode('ascii'))
+            await writer.drain()
+            status, headers = await self._headers(reader)
+            parts = status.split(' ')
+            if len(parts) < 2 or parts[0] not in {'HTTP/1.0', 'HTTP/1.1'} or not parts[1].isdigit() or not 200 <= int(parts[1]) < 300:
+                raise FetchUrlError('上游代理拒绝 CONNECT 公网目标')
+            return reader, writer
+        except BaseException:
+            await self._close_writer(writer)
+            raise
+
+    async def _reply(self, writer: asyncio.StreamWriter, code: int) -> None:
+        names = {400: 'Bad Request', 403: 'Forbidden', 405: 'Method Not Allowed', 407: 'Proxy Authentication Required', 502: 'Bad Gateway', 504: 'Gateway Timeout'}
+        extra = 'Proxy-Authenticate: Basic realm="browser-tunnel"\r\n' if code == 407 else ''
+        if writer.is_closing():
+            return
+        try:
+            writer.write((f'HTTP/1.1 {code} {names[code]}\r\n' + extra + 'Connection: close\r\nContent-Length: 0\r\n\r\n').encode('ascii'))
+            async with asyncio.timeout(self._CLOSE_SECONDS):
+                await writer.drain()
+        except (OSError, TimeoutError):
+            return
+
+    async def _pump(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        while True:
+            data = await reader.read(64 * 1024)
+            if not data:
+                if writer.can_write_eof():
+                    writer.write_eof()
+                    await writer.drain()
+                return
+            writer.write(data)
+            await writer.drain()
+
+    async def _serve(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        upstream_writer = None
+        relays = []
+        established = False
+        try:
+            async with asyncio.timeout(self._HANDSHAKE_SECONDS):
+                line, headers = await self._headers(reader)
+                if not self._authenticated(headers):
+                    await self._reply(writer, 407)
+                    return
+                parts = line.split(' ')
+                if len(parts) != 3 or parts[2] not in {'HTTP/1.0', 'HTTP/1.1'}:
+                    self.last_error = '拒绝无效的 CONNECT 请求格式'
+                    await self._reply(writer, 400)
+                    return
+                if parts[0] != 'CONNECT':
+                    self.last_error = '浏览器安全隧道只允许 CONNECT，不允许明文 HTTP 请求'
+                    await self._reply(writer, 405)
+                    return
+                if 'content-length' in headers or 'transfer-encoding' in headers:
+                    raise FetchUrlError('拒绝带 HTTP 请求体的 CONNECT 握手')
+                addresses = await self._target(parts[1])
+                upstream_reader, upstream_writer = await self._connect(addresses)
+                writer.write(b'HTTP/1.1 200 Connection Established\r\n\r\n')
+                await writer.drain()
+                established = True
+            async with asyncio.timeout(self._RELAY_SECONDS):
+                relays = [asyncio.create_task(self._pump(reader, upstream_writer)), asyncio.create_task(self._pump(upstream_reader, writer))]
+                await asyncio.gather(*relays)
+        except asyncio.CancelledError:
+            raise
+        except FetchUrlError as exc:
+            self.last_error = str(exc)
+            if not established:
+                await self._reply(writer, 403)
+        except TimeoutError:
+            self.last_error = '浏览器安全隧道握手或字节转发超时'
+            if not established:
+                await self._reply(writer, 504)
+        except Exception as exc:
+            self.last_error = f'浏览器安全隧道连接失败（{type(exc).__name__}）'
+            if not established:
+                try:
+                    await self._reply(writer, 502)
+                except (OSError, ConnectionError):
+                    pass
+        finally:
+            for task in relays:
+                if not task.done():
+                    task.cancel()
+            if relays:
+                await asyncio.gather(*relays, return_exceptions=True)
+            if upstream_writer is not None:
+                await self._close_writer(upstream_writer)
+            await self._close_writer(writer)
+
+
 class FetchUrlPlugin(MaiBotPlugin):
     """fetch_url 插件主体。"""
 
@@ -2084,6 +2500,16 @@ class FetchUrlPlugin(MaiBotPlugin):
         self._fetch_cache_ttl_seconds = DEFAULT_FETCH_CACHE_TTL_SECONDS
         self._fetch_cache_max_entries = DEFAULT_FETCH_CACHE_MAX_ENTRIES
         self._config_initialized = False
+        self._browser_enabled = True
+        self._browser_timeout = 30.0
+        self._browser_baike_proxy = "inherit"
+        self._browser_kkbox_proxy = "direct"
+        self._browser_lock = asyncio.Lock()
+        self._browser_runtime: Any = None
+        self._browser_sessions: dict[str, tuple[Any, Any, float, _BrowserTunnelGuard]] = {}
+        self._browser_guards: dict[str, _BrowserTunnelGuard] = {}
+        self._browser_last_request: dict[str, float] = {}
+        self._browser_cooldown: dict[str, tuple[float, str]] = {}
 
     async def _llm_generate(self, prompt: Any, configured: str, **extra: Any) -> dict[str, Any]:
         """按配置调用 Host LLM：任务名走 ``task_name``，否则 ``model_name``。"""
@@ -2131,6 +2557,7 @@ class FetchUrlPlugin(MaiBotPlugin):
         if self._alt_cache is not None:
             await self._alt_cache.aclose()
             self._alt_cache = None
+        await self._close_browser_sessions()
         self.ctx.logger.info("fetch_url 插件已卸载")
 
     async def on_config_update(self, scope: str, config_data: dict[str, Any], version: str) -> None:
@@ -2138,6 +2565,7 @@ class FetchUrlPlugin(MaiBotPlugin):
         if scope == "self":
             self._refresh_config()
             self._vlm_available = None
+            await self._close_browser_sessions()
             if self._alt_cache is not None:
                 self._alt_cache.set_max_entries(self._alt_cache_size)
             if self._fetch_cache is not None:
@@ -2196,6 +2624,10 @@ class FetchUrlPlugin(MaiBotPlugin):
 
         fetch = self.config.fetch
         self._timeout = effective.timeout
+        self._browser_enabled = effective.browser_enabled
+        self._browser_timeout = effective.browser_timeout
+        self._browser_baike_proxy = effective.browser_baike_proxy
+        self._browser_kkbox_proxy = effective.browser_kkbox_proxy
         self._proxy = (fetch.proxy or "").strip()
         self._user_agent = effective.user_agent
         self._max_download_size = effective.max_download_size
@@ -2330,7 +2762,8 @@ class FetchUrlPlugin(MaiBotPlugin):
     def _fetch_cache_key(self, url: str) -> str:
         """按 URL、User-Agent 与 Cookie 生成抓取缓存键。"""
         cookie_header = self._cookie_header_for(url)
-        raw = f"{url.strip()}\n{self._user_agent}\n{cookie_header}"
+        strategy = f"browser-v3:{self._browser_enabled}:{self._browser_baike_proxy}:{self._browser_kkbox_proxy}:{self._allow_private_networks}:{self._proxy}"
+        raw = f"{url.strip()}\n{self._user_agent}\n{cookie_header}\n{strategy}"
         return sha256(raw.encode("utf-8")).hexdigest()
 
     def _store_fetch_cache(self, cache_key: str, payload: dict[str, Any]) -> None:
@@ -2378,6 +2811,9 @@ class FetchUrlPlugin(MaiBotPlugin):
             headers["Cookie"] = cookie_header
 
         async with client.stream("GET", url, headers=headers) as response:
+            problem = _browser_access_error(response.status_code, response.headers, "")
+            if problem:
+                raise FetchUrlError(problem)
             response.raise_for_status()
             final_url = str(response.url)
             content_type = (response.headers.get("content-type") or "").split(";")[0].strip().lower()
@@ -2424,6 +2860,10 @@ class FetchUrlPlugin(MaiBotPlugin):
                     raise FetchUrlError(
                         f"页面超过下载大小上限（{self._max_download_size} 字节），已中止下载"
                     )
+            if "html" in content_type:
+                problem = await asyncio.to_thread(_browser_access_error, response.status_code, response.headers, bytes(buffer).decode(response.charset_encoding or "utf-8", errors="replace"))
+                if problem:
+                    raise FetchUrlError(problem)
             return {
                 "kind": "text",
                 "data": bytes(buffer),
@@ -2480,6 +2920,9 @@ class FetchUrlPlugin(MaiBotPlugin):
             headers["Cookie"] = cookie_header
 
         async with client.stream("GET", url, headers=headers) as response:
+            problem = _browser_access_error(response.status_code, response.headers, "")
+            if problem:
+                raise FetchUrlError(problem)
             response.raise_for_status()
             content_type = (response.headers.get("content-type") or "").split(";")[0].strip().lower()
             buffer = bytearray()
@@ -2893,6 +3336,174 @@ class FetchUrlPlugin(MaiBotPlugin):
         )
         return _normalize_lrs_procedure_result(request_id, parsed.url, result, started)
 
+    async def _close_browser_sessions(self) -> None:
+        async with self._browser_lock:
+            for browser, context, _, guard in self._browser_sessions.values():
+                await guard.close()
+                await context.close()
+                await browser.close()
+            self._browser_sessions.clear()
+            self._browser_guards.clear()
+            self._browser_cooldown.clear()
+            if self._browser_runtime is not None:
+                await self._browser_runtime.stop()
+                self._browser_runtime = None
+
+    async def _browser_context(self, site: str) -> Any:
+        from playwright.async_api import async_playwright
+        import os
+
+        mode = self._browser_baike_proxy if site == "baike" else self._browser_kkbox_proxy
+        proxy_url = self._proxy if mode == "inherit" else ""
+        key = sha256(f"{site}\n{proxy_url}".encode()).hexdigest()
+        existing = self._browser_sessions.get(key)
+        if existing is not None:
+            browser, context, created, guard = existing
+            if browser.is_connected() and time.monotonic() - created < 900:
+                return context
+            await guard.close()
+            await context.close()
+            await browser.close()
+            del self._browser_sessions[key]
+            self._browser_guards.pop(site, None)
+        if self._browser_runtime is None:
+            self._browser_runtime = await async_playwright().start()
+        guard = _BrowserTunnelGuard(site, proxy_url, self._allow_private_networks)
+        await guard.start()
+        args = ["--force-webrtc-ip-handling-policy=disable_non_proxied_udp", "--disable-quic"]
+        env = {key: value for key, value in os.environ.items() if key in {"PATH", "HOME", "LANG", "LC_ALL", "TZ", "TMPDIR", "TEMP", "TMP", "DISPLAY", "XDG_RUNTIME_DIR", "DBUS_SESSION_BUS_ADDRESS", "SYSTEMROOT", "WINDIR", "USERPROFILE", "LOCALAPPDATA", "APPDATA"}}
+        try:
+            browser = await self._browser_runtime.chromium.launch(headless=True, chromium_sandbox=True, proxy=guard.proxy, args=args, env=env)
+        except BaseException:
+            await guard.close()
+            raise
+        try:
+            if int(browser.version.split(".", 1)[0]) < 145:
+                raise FetchUrlError("浏览器安全读取要求 Chromium 145 或更新版本，请升级 Playwright 及 Chromium。")
+            cdp = await browser.new_browser_cdp_session()
+            version = await cdp.send("Browser.getVersion")
+            await cdp.detach()
+            user_agent = version["userAgent"].replace("HeadlessChrome/", "Chrome/")
+            context = await browser.new_context(user_agent=user_agent, locale="zh-CN", accept_downloads=False, service_workers="block")
+            async def block_socket(socket: Any) -> None:
+                await socket.close(code=1008, reason="Document reader does not use WebSocket")
+            await context.route_web_socket("**/*", block_socket)
+            self._browser_sessions[key] = (browser, context, time.monotonic(), guard)
+            self._browser_guards[site] = guard
+            return context
+        except BaseException:
+            await browser.close()
+            await guard.close()
+            raise
+
+    async def _fetch_browser_document(self, url: str, site: str) -> tuple[str, str, dict[str, str]]:
+        from playwright.async_api import Error as PlaywrightError, TimeoutError as PlaywrightTimeout
+
+        page = None
+        guard = None
+        locked = False
+        attempted = False
+        context = None
+        route_request = None
+        state: dict[str, Any] = {"status": 0, "headers": {}, "policy_error": ""}
+        try:
+            async with asyncio.timeout(self._browser_timeout):
+                await self._browser_lock.acquire()
+                locked = True
+                now = time.monotonic()
+                cooldown = self._browser_cooldown.get(site)
+                if cooldown is not None and cooldown[0] > now:
+                    raise FetchUrlError(cooldown[1] + " 暂停重复请求 60 秒。")
+                attempted = True
+                delay = self._browser_last_request.get(site, 0) + 2 - now
+                if delay > 0:
+                    await asyncio.sleep(delay)
+                context = await self._browser_context(site)
+                guard = self._browser_guards.get(site)
+                if guard is not None:
+                    guard.last_error = ""
+                page = await context.new_page()
+                network = await context.new_cdp_session(page)
+                await network.send("Network.enable")
+                await network.send("Network.setBlockedURLs", {"urlPatterns": _browser_network_patterns(site)})
+                async def close_popup(popup: Any) -> None:
+                    await popup.close()
+                page.on("popup", close_popup)
+                async def route_request(route: Any) -> None:
+                    request = route.request
+                    main_document = request.is_navigation_request() and request.frame == page.main_frame
+                    if not _browser_resource_allowed(site, request.url):
+                        if main_document:
+                            state["policy_error"] = "浏览器主文档跳转到了未授权域名或非 HTTPS 地址。"
+                        await route.abort()
+                        return
+                    if (request.is_navigation_request() and not main_document) or request.resource_type in {"image", "media", "font"}:
+                        await route.abort()
+                        return
+                    try:
+                        await self._assert_host_allowed(urlparse(request.url).hostname or "")
+                    except FetchUrlError as exc:
+                        state["policy_error"] = str(exc)
+                        await route.abort()
+                        return
+                    if request.method not in {"GET", "HEAD"} and not (urlparse(request.url).hostname or "").endswith(".awswaf.com"):
+                        await route.abort()
+                        return
+                    await route.continue_()
+                await context.route("**/*", route_request)
+                def document_response(response: Any) -> None:
+                    if 300 <= response.status < 400 and response.headers.get("location"):
+                        destination = urljoin(response.url, response.headers["location"])
+                        if not _browser_resource_allowed(site, destination):
+                            state["policy_error"] = "站点重定向超出了 HTTPS 资源域名白名单。"
+                    if response.request.is_navigation_request() and response.frame == page.main_frame:
+                        state["status"] = response.status
+                        state["headers"] = response.headers
+                page.on("response", document_response)
+                target = "https://" + url.split("://", 1)[1]
+                await page.goto(target, wait_until="domcontentloaded", timeout=self._browser_timeout * 1000)
+                await page.locator("h1").wait_for(state="visible", timeout=self._browser_timeout * 1000)
+                html = await page.content()
+                if state["policy_error"]:
+                    raise FetchUrlError("浏览器请求被安全策略阻止：" + state["policy_error"])
+                if guard is not None and guard.last_error and ("拒绝" in guard.last_error or "只允许 CONNECT" in guard.last_error):
+                    raise FetchUrlError("浏览器安全隧道阻止了请求：" + guard.last_error)
+                if len(html.encode("utf-8")) > self._max_download_size:
+                    raise FetchUrlError("浏览器正文超过下载大小上限。")
+                await asyncio.to_thread(_validate_browser_document, url, page.url, state["status"], state["headers"], html)
+                mode = self._browser_baike_proxy if site == "baike" else self._browser_kkbox_proxy
+                return html, page.url, {"content_type": "text/html", "reader": "anonymous_chromium", "browser_route": "configured_proxy" if mode == "inherit" and self._proxy else "system_fake_ip_proxy" if guard is not None and guard.uses_system_fake_ip else "direct"}
+        except (TimeoutError, PlaywrightTimeout):
+            if guard is not None and guard.last_error:
+                raise FetchUrlError("浏览器安全隧道：" + guard.last_error) from None
+            if state["policy_error"]:
+                raise FetchUrlError("浏览器请求被安全策略阻止：" + state["policy_error"]) from None
+            problem = _browser_access_error(state["status"], state["headers"], "")
+            if problem:
+                self._browser_cooldown[site] = (time.monotonic() + 60, problem)
+            raise FetchUrlError(problem or "浏览器读取超时，尚未取得可验证正文。") from None
+        except PlaywrightError:
+            if guard is not None and guard.last_error:
+                raise FetchUrlError("浏览器安全隧道：" + guard.last_error) from None
+            if state["policy_error"]:
+                raise FetchUrlError("浏览器请求被安全策略阻止：" + state["policy_error"]) from None
+            raise FetchUrlError("浏览器读取失败，请确认已安装 Playwright Chromium；未返回或缓存页面。") from None
+        except FetchUrlError as exc:
+            if attempted and any(code in str(exc) for code in ("CAPTCHA_REQUIRED", "BROWSER_CHALLENGE", "ACCESS_DENIED")):
+                self._browser_cooldown[site] = (time.monotonic() + 60, str(exc))
+            raise
+        finally:
+            if attempted:
+                self._browser_last_request[site] = time.monotonic()
+            try:
+                if page is not None and not page.is_closed():
+                    await page.close()
+                if context is not None and route_request is not None:
+                    await context.unroute("**/*", route_request)
+            finally:
+                if locked:
+                    self._browser_lock.release()
+
     async def _fetch_url_impl(
         self,
         *,
@@ -2945,20 +3556,27 @@ class FetchUrlPlugin(MaiBotPlugin):
                     from_cache=True,
                 )
 
-        async with self._build_client() as client:
-            probe = await self._probe_url(client, url)
+        site = _browser_site_for_url(url) if self._browser_enabled else None
+        if site is not None:
+            html, final_url, metadata = await self._fetch_browser_document(url, site)
+            markdown, content_metadata = await asyncio.to_thread(self._text_content_to_markdown, html, content_type="text/html", base_url=final_url)
+            metadata.update(content_metadata)
+            provider = "browser"
+        else:
+            async with self._build_client() as client:
+                probe = await self._probe_url(client, url)
 
-            if probe["kind"] == "image":
-                metadata = {"content_type": probe.get("content_type", "image/*")}
-                self._store_fetch_cache(
-                    cache_key,
-                    {"kind": "image", "probe": probe, "metadata": metadata},
-                )
-                if return_image:
-                    return await self._build_image_result(url, probe, metadata=metadata)
-                return await self._build_image_describe_result(url, probe, metadata=metadata)
+                if probe["kind"] == "image":
+                    metadata = {"content_type": probe.get("content_type", "image/*")}
+                    self._store_fetch_cache(
+                        cache_key,
+                        {"kind": "image", "probe": probe, "metadata": metadata},
+                    )
+                    if return_image:
+                        return await self._build_image_result(url, probe, metadata=metadata)
+                    return await self._build_image_describe_result(url, probe, metadata=metadata)
 
-            markdown, provider, final_url, metadata = await self._fetch_text_content(client, url, probe)
+                markdown, provider, final_url, metadata = await self._fetch_text_content(client, url, probe)
 
         self._store_fetch_cache(
             cache_key,
