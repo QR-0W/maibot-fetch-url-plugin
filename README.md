@@ -48,25 +48,28 @@
 替换优先级：**VLM 描述 > jina 生成的 alt（需配置 `jina.api_key` 且开启 `with_generated_alt`）> 网页原始 alt**。
 
 - 页面图片多于 `max_images`（默认 **0**，即关闭）时，按 HEAD `Content-Length` 排序优先描述**最大**的几张（跳过最短边小于 `min_dimension` 的图标 / Logo）
+- `alt_text.prompt` 留空时使用内置中文描述提示词，配置页以灰色占位内容显示；填写后覆盖默认值，不会自动开启图片描述。
 - 关闭 VLM 时仍保留 jina / 原始 alt，并为每张图的 alt 追加提示：`You can call fetch_url again to obtain this image.`（可再调 `fetch_url` 拉取原图）
 - 送入 VLM 前**始终**经体积估算单次压缩管道转码（由独立的 `[alt_text.image]` 配置，默认 WebP、目标 1 MB、最长边 2048 px）
 - 描述结果以图片内容 sha256 为键持久缓存在 `data/alt_text_cache.json`（LRU，默认 1024 条），重复抓取不再消耗 VLM 调用
 - VLM 任务未配置时自动跳过，保留 jina / 原始 alt
 - 直接抓取的单张图片无需此机制——MaiBot 主程序会自动为工具回传的图片生成并缓存描述
 
-### 定向浏览器读取与请求安全
+### 按响应内容决定是否执行脚本
 
-百度百科词条和 KKBOX 歌曲原页默认由独立匿名 Chromium 读取，不再先用普通 HTTP 请求撞上验证页。读取仍返回原页面的 Markdown，继续使用现有元信息、分页、缓存及 Tool/API/LRS 接口。图片、PDF、JSON 和其他网址保持原有分流。
+所有域名共用同一套读取流程。先用流式 HTTP 请求探测响应头和魔数，图片、PDF、JSON 继续使用原有专用处理。已有有效正文的 HTML 直接转换为 Markdown；开启 `jina.enabled` 时保留原有 Jina 优先策略。
 
-浏览器保持 TLS 证书校验和沙箱，HTTP(S) 资源使用域名白名单和地址预检，出站连接另由认证隧道约束；阻止媒体、字体、图片、WebSocket、Service Worker、弹窗及非必要写请求，不加载个人浏览器档案或配置中的登录 Cookie。站点签发的匿名会话仅存内存，最多保留 15 分钟；请求串行，同站至少间隔 2 秒。遇到访问拒绝或验证码时明确失败并冷却 60 秒，不自动换 IP、重试其他后端或把验证页缓存成正文。
+HTML 只有脚本空壳、缺少正文，或明确要求自动脚本校验时，才触发一次通用 Chromium 渲染。判断依据是响应和正文结构，不是网站域名，也不要求页面具有 `h1`。渲染会在预算内等待正文出现，导航和页脚不作为正文就绪的依据。验证码、登录要求、限流、明确拒绝访问和安全策略拦截会直接报错，不循环切换后端或代理。
 
-网站 HTTPS 隧道经过本机随机端口的认证出站代理，不开放给局域网。隧道仅允许资源白名单的 443 端口，一般 DNS 结果必须全部为公网地址，再按校验后的 IP 连接，防止原生重定向和 Worker 绕过页面钩子。
+每次渲染使用新的匿名上下文，不读取个人浏览器档案或配置中的 Cookie；页面签发的临时会话在本次读取结束后销毁。浏览器串行运行，每次读取后关闭，不按网站积累实例。保持 TLS 证书校验和浏览器沙箱，阻止子框架导航、弹窗、WebSocket、Service Worker，以及图片、媒体和字体加载；HTTPS 的 XHR/fetch POST 可用于页面数据查询和自动脚本校验，不操作页面表单。
 
-系统 DNS 全部返回 `198.18.0.0/15` Fake-IP 时，仅在已有 `fetch.allow_private_networks=true` 授权且没有显式上游代理的情况下，将其识别为系统透明代理入口。该例外不扩大到回环、普通私网或混合地址，也不会把 Fake-IP 交给上游代理。最终实现保留系统 DNS，不使用额外的外部 DNS 服务。隧道不解密 HTTPS，浏览器仍验证原网站证书；这不是操作系统级网络沙箱。代理凭据与临时认证不写入日志或正文。
+浏览器出站经过认证的本机代理防护，支持标准 HTTP 80 / HTTPS 443。普通 DNS 结果必须全部为公网地址，并固定连接已校验 IP；重定向和 Worker 的连接同样受约束。真实私网、混合公网/私网结果和混合 Fake-IP 结果仍会拒绝。
 
-`[browser]` 设置：`enabled=true`、`timeout=30`（总预算，范围 5–45 秒）、`baike_proxy="inherit"`（隧道经 `fetch.proxy` 转发）、`kkbox_proxy="direct"`（隧道直接连接目标）。上游 CONNECT 使用已验证的公网 IP，目标 TLS 主机名仍为原网址；基于域名的代理分流可能因此与旧链路不同。可以单独关闭浏览器路径。修改策略会隔离旧正文缓存并清理匿名会话；这不会改系统代理。UA 根据实际 Chromium 版本生成，HTTP 路径的 `fetch.user_agent` 保持原配置。
+系统 DNS 全部返回 `198.18.0.0/15` Fake-IP 时，只有已有 `fetch.allow_private_networks=true` 授权才允许使用系统透明代理或已配置的本机回环代理。经本机显式代理时，把已校验的原主机名交给该代理解析，不把数值 Fake-IP 当作实际网站地址，也不转交远程或局域网代理。此例外依赖本机代理完成真实解析，本插件无法独立验证它最终连接的真实 IP。不修改系统 DNS、代理或证书设置，不添加外部 DNS 服务。
 
-依赖 Playwright 1.58 或更新版本，以及 Chromium 145 或更新版本。当前主程序已声明 Playwright 依赖；其他部署缺少浏览器时可在对应 Python 环境运行 `python -m playwright install chromium`，插件不会自动下载浏览器。网站若仍要求人工验证码，返回 `CAPTCHA_REQUIRED`；未完成脚本校验返回 `BROWSER_CHALLENGE`，不承诺所有网站都能自动读取。
+通用渲染使用 `rendering.enabled=true`、`rendering.timeout=30`（秒，范围 5–45，包含排队、启动、加载和验证）及 `rendering.proxy_mode="inherit"`。`inherit` 沿用 `fetch.proxy`，`direct` 只是不使用显式代理，仍保留系统网络。未安装 Chromium 时需要在对应环境安装浏览器，插件不会自动下载。
+
+旧 `[browser]` 节仅保留配置兼容，不在可视化界面显示，旧开关及站点代理策略不再影响读取。新缓存区分通用渲染开关、代理策略与 Jina 设置，不复用旧站点浏览器结果。图片、PDF、分页、总结和 Tool/API/LRS 接口继续沿用既有实现。此机制提高动态网页的覆盖范围，不承诺绕过人工验证、登录或地区/IP 限制。
 
 ## 安装
 
@@ -80,11 +83,27 @@
 
 ## 配置
 
-完整配置项见 [config.toml](config.toml)，均可在 WebUI 中编辑。常用项：
+WebUI 按功能展示四张卡片，每个分组有独立标题和分隔线：
+
+| 卡片 | 分组 |
+| --- | --- |
+| 工具开关与网站连接 | 工具开关与可见性、连接、网站访问凭据（可选） |
+| 网页读取与正文处理 | Jina 正文读取、脚本网页自动渲染、正文长度与超长处理、总结模型和提示词、共享模型调用超时 |
+| 图片返回与内容描述 | 直接返回图片时的转码与压缩、网页图片转文字、发送给图片描述模型前的压缩 |
+| 读取结果与图片描述缓存 | 抓取结果内存缓存、图片描述持久化缓存 |
+
+连接分组统一管理代理、请求超时、下载上限、User-Agent 和内网访问权限。可见字段均有中文名称和用途说明；例如 `fetch.proxy` 显示为「代理」，但 TOML 键名不变。网站访问凭据用于目标网站，不是插件登录；经 Jina 读取时，匹配的 Cookie 会转发给 Jina，本地浏览器读取不使用这些 Cookie。
+
+按域名设置 Cookie 时，界面使用「域名 / Cookie」两列，支持添加、修改和删除。域名只填主机名，不含协议或路径；Cookie 默认隐藏，可手动显示。保存仍使用 `fetch.domain_cookies` 映射，无需改写 TOML 结构。
+
+原配置路径保持不变，通用渲染新增 `rendering` 节，旧 `browser` 节仅兼容保留。`alt_text.image` 仍使用原有嵌套对象；`plugin.config_version` 不在界面展示，无需迁移原有配置键。常用项：
 
 
 | 配置项                                      | 默认值               | 说明                             |
 | ---------------------------------------- | ----------------- | ------------------------------ |
+| `rendering.enabled`                    | true              | HTML 需要脚本时尝试一次匿名渲染 |
+| `rendering.timeout`                    | 30                | 单次渲染预算，单位秒，范围 5–45 |
+| `rendering.proxy_mode`                 | inherit           | 沿用 `fetch.proxy`；可选 `direct`，所有网站使用同一策略 |
 | `plugin.always_visible_for_planner`      | false             | 让 `fetch_url` 始终对 Planner 可见（无需 `tool_search`）；**修改后需重新加载插件** |
 | `fetch.timeout`                          | 15                | 直接抓取超时（秒）                      |
 | `fetch.user_agent`                       | Chrome 风格 UA    | 抓取时使用的 User-Agent              |
